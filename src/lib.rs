@@ -12,8 +12,10 @@ use futures::{Future, Poll, Async, BoxFuture};
 use tokio_core::reactor::{Remote};
 use tokio_postgres::error::ConnectError;
 use tokio_postgres::{Connection, TlsMode};
+use tokio_postgres::params::{ConnectParams, IntoConnectParams};
 
 pub struct InnerPool {
+    params: ConnectParams,
     remote: Remote,
     queue: VecDeque<Task>,
     conns: VecDeque<Connection>,
@@ -30,13 +32,18 @@ enum Conn {
 }
 
 impl Pool {
-    pub fn new(remote: Remote, size: i32) -> Self {
-        Pool(Arc::new(Mutex::new(InnerPool{
+    pub fn new<T>(params: T, remote: Remote, size: i32) -> Result<Self, ConnectError>
+        where T: IntoConnectParams
+    {
+        let params = params.into_connect_params().map_err(ConnectError::ConnectParams)?;
+
+        Ok(Pool(Arc::new(Mutex::new(InnerPool{
+            params: params,
             remote: remote,
             queue: VecDeque::new(),
             conns: VecDeque::new(),
             size: size,
-        })))
+        }))))
     }
 
     #[inline]
@@ -56,7 +63,7 @@ impl Pool {
             Some(conn) => Conn::Now(conn),
             None => {
                 if let Some(handle) = inner.remote.handle() {
-                    let conn = Connection::connect("postgresql://brillen@localhost/brillen2",
+                    let conn = Connection::connect(inner.params.clone(),
                                        TlsMode::None,
                                        &handle);
                     Conn::Future(conn)
