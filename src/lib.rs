@@ -2,6 +2,9 @@ extern crate tokio_postgres;
 extern crate tokio_core;
 extern crate futures;
 
+use std::fmt;
+use std::error;
+use std::error::Error as _Error;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, LockResult, MutexGuard};
 use futures::task::{Task, park};
@@ -9,11 +12,6 @@ use futures::{Future, Poll, Async, BoxFuture};
 use tokio_core::reactor::{Remote};
 use tokio_postgres::error::ConnectError;
 use tokio_postgres::{Connection, TlsMode};
-
-#[derive(Debug)]
-pub enum Error {
-    Todo,
-}
 
 pub struct InnerPool {
     remote: Remote,
@@ -27,6 +25,7 @@ pub struct Pool(Arc<Mutex<InnerPool>>);
 enum Conn {
     Now(Connection),
     Future(BoxFuture<Connection, ConnectError>),
+    Err(Error),
     None
 }
 
@@ -56,12 +55,14 @@ impl Pool {
         match inner.conns.pop_front() {
             Some(conn) => Conn::Now(conn),
             None => {
-                // TODO: no unwrap
-                let conn = Connection::connect("postgresql://brillen@localhost/brillen2",
-                                   TlsMode::None,
-                                   &inner.remote.handle().unwrap());
-
-                Conn::Future(conn)
+                if let Some(handle) = inner.remote.handle() {
+                    let conn = Connection::connect("postgresql://brillen@localhost/brillen2",
+                                       TlsMode::None,
+                                       &handle);
+                    Conn::Future(conn)
+                } else {
+                    Conn::Err(Error::EventLoop)
+                }
             }
         }
     }
@@ -102,8 +103,8 @@ impl Pool {
             .map_err(move |err| {
                 let mut inner = pool1.lock().unwrap();
                 inner.size += 1;
-                println!("Postgres Error: {:?}", err);
-                E::from(Error::Todo)
+
+                E::from(err)
             })
             .and_then(move |conn| {
                 f(conn).then(move |res| {
@@ -140,22 +141,23 @@ struct FutureConnection {
 
 impl Future for FutureConnection {
     type Item = Connection;
-    type Error = ConnectError;
+    type Error = Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         if let Some(ref mut conn) = self.conn {
-            return conn.poll();
+            return conn.poll().map_err(Error::Connect);
         }
 
         match self.pool.acquire() {
             Conn::Now(conn) => Ok(Async::Ready(conn)),
             Conn::Future(mut conn) => {
-                let result = conn.poll();
+                let result = conn.poll().map_err(Error::Connect);
                 if let Ok(Async::NotReady) = result {
                     self.conn = Some(conn);
                 }
                 result
             },
+            Conn::Err(err) => Err(err),
             Conn::None => {
                 self.pool.enqueue(park());
                 Ok(Async::NotReady)
@@ -163,3 +165,32 @@ impl Future for FutureConnection {
         }
     }
 }
+
+#[derive(Debug)]
+pub enum Error {
+    Connect(ConnectError),
+    EventLoop
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "{}", self.description())
+    }
+}
+
+impl error::Error for Error {
+    fn description(&self) -> &str {
+        match *self {
+            Error::Connect(ref err) => err.description(),
+            Error::EventLoop => "Event loop not running",
+        }
+    }
+
+    fn cause(&self) -> Option<&error::Error> {
+        match *self {
+            Error::Connect(ref err) => Some(err as &error::Error),
+            _ => None,
+        }
+    }
+}
+
