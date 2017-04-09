@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, LockResult, MutexGuard};
 use futures::task::{Task, park};
 use futures::{Future, Poll, Async, BoxFuture};
-use tokio_core::reactor::{Remote};
+use tokio_core::reactor::Remote;
 use tokio_postgres::error::ConnectError;
 use tokio_postgres::{Connection, TlsMode};
 use tokio_postgres::params::{ConnectParams, IntoConnectParams};
@@ -28,14 +28,15 @@ enum Conn {
     Now(Connection),
     Future(BoxFuture<Connection, ConnectError>),
     Err(Error),
-    None
+    None,
 }
 
 impl Pool {
     pub fn new<T>(params: T, remote: Remote, size: i32) -> Result<Self, ConnectError>
         where T: IntoConnectParams
     {
-        let params = params.into_connect_params().map_err(ConnectError::ConnectParams)?;
+        let params = params.into_connect_params()
+            .map_err(ConnectError::ConnectParams)?;
 
         Ok(Pool(Arc::new(Mutex::new(InnerPool{
             params: params,
@@ -63,9 +64,7 @@ impl Pool {
             Some(conn) => Conn::Now(conn),
             None => {
                 if let Some(handle) = inner.remote.handle() {
-                    let conn = Connection::connect(inner.params.clone(),
-                                       TlsMode::None,
-                                       &handle);
+                    let conn = Connection::connect(inner.params.clone(), TlsMode::None, &handle);
                     Conn::Future(conn)
                 } else {
                     Conn::Err(Error::EventLoop)
@@ -102,12 +101,11 @@ impl Pool {
     {
         let pool1 = self.clone();
         let pool2 = self.clone();
-        let conn = FutureConnection{
+        let conn = FutureConnection {
             pool: self.clone(),
             conn: None,
         };
-        conn
-            .map_err(move |err| {
+        conn.map_err(move |err| {
                 let mut inner = pool1.lock().unwrap();
                 inner.size += 1;
 
@@ -131,7 +129,7 @@ impl Pool {
                     }
                 })
             })
-        .boxed()
+            .boxed()
     }
 }
 
@@ -163,7 +161,7 @@ impl Future for FutureConnection {
                     self.conn = Some(conn);
                 }
                 result
-            },
+            }
             Conn::Err(err) => Err(err),
             Conn::None => {
                 self.pool.enqueue(park());
@@ -176,7 +174,7 @@ impl Future for FutureConnection {
 #[derive(Debug)]
 pub enum Error {
     Connect(ConnectError),
-    EventLoop
+    EventLoop,
 }
 
 impl fmt::Display for Error {
@@ -200,4 +198,3 @@ impl error::Error for Error {
         }
     }
 }
-
