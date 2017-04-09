@@ -1,0 +1,9 @@
+[package]
+name = "postgres-pool"
+version = "0.1.0"
+authors = ["Markus Ast <m@rkusa.st>"]
+
+[dependencies]
+futures = "0.1"
+tokio-core = "0.1"
+tokio-postgres = "0.2"
