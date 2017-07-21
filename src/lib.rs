@@ -1,3 +1,5 @@
+#![feature(conservative_impl_trait)]
+
 extern crate tokio_postgres;
 extern crate tokio_core;
 extern crate futures;
@@ -8,10 +10,10 @@ use std::error::Error as _Error;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::cell::RefCell;
-use futures::task::{Task, park};
+use futures::task::{self, Task};
 use futures::{Future, Poll, Async, BoxFuture};
 use tokio_core::reactor::Handle;
-use tokio_postgres::error::ConnectError;
+use tokio_postgres::error::{ConnectError, Error as PostgresError};
 use tokio_postgres::{Connection, TlsMode};
 use tokio_postgres::params::{ConnectParams, IntoConnectParams};
 
@@ -33,12 +35,14 @@ enum Conn {
 
 impl Pool {
     pub fn new<T>(params: T, handle: Handle, size: i32) -> Result<Self, ConnectError>
-        where T: IntoConnectParams
+    where
+        T: IntoConnectParams,
     {
-        let params = params.into_connect_params()
-            .map_err(ConnectError::ConnectParams)?;
+        let params = params.into_connect_params().map_err(
+            ConnectError::ConnectParams,
+        )?;
 
-        Ok(Pool(Rc::new(RefCell::new(InnerPool{
+        Ok(Pool(Rc::new(RefCell::new(InnerPool {
             params: params,
             handle: handle,
             queue: VecDeque::new(),
@@ -70,7 +74,7 @@ impl Pool {
         inner.size += 1;
 
         if let Some(task) = inner.queue.pop_front() {
-            task.unpark();
+            task.notify();
         }
     }
 
@@ -84,11 +88,12 @@ impl Pool {
         inner.queue.push_back(task);
     }
 
-    pub fn with_connection<F, R, I, E>(&self, f: F) -> Box<Future<Item=I, Error=E> + 'static>
-        where F: FnOnce(Connection) -> R + 'static,
-              R: Future<Item = (I, Connection), Error = (E, Option<Connection>)> + 'static,
-              I: 'static,
-              E: From<Error> + 'static
+    pub fn with_connection<F, R, I, E>(&self, f: F) -> impl Future<Item = I, Error = E>
+    where
+        F: FnOnce(Connection) -> R + 'static,
+        R: Future<Item = (I, Connection), Error = (E, Option<Connection>)> + 'static,
+        I: 'static,
+        E: From<Error> + 'static,
     {
         let pool1 = self.clone();
         let pool2 = self.clone();
@@ -97,30 +102,27 @@ impl Pool {
             conn: None,
         };
         let fut = conn.map_err(move |err| {
-                let mut inner = pool1.0.borrow_mut();
-                inner.size += 1;
+            let mut inner = pool1.0.borrow_mut();
+            inner.size += 1;
 
-                E::from(Error::Connect(err))
-            })
-            .and_then(move |conn| {
-                f(conn).then(move |res| {
-                    match res {
-                        Ok((result, conn)) => {
-                            pool2.release(conn);
-                            Ok(result)
-                        }
-                        Err((err, Some(conn))) => {
-                            pool2.release(conn);
-                            Err(err)
-                        }
-                        Err((err, None)) => {
-                            pool2.connection_lost();
-                            Err(err)
-                        }
+            E::from(Error::Connect(err))
+        }).and_then(move |conn| {
+                f(conn).then(move |res| match res {
+                    Ok((result, conn)) => {
+                        pool2.release(conn);
+                        Ok(result)
+                    }
+                    Err((err, Some(conn))) => {
+                        pool2.release(conn);
+                        Err(err)
+                    }
+                    Err((err, None)) => {
+                        pool2.connection_lost();
+                        Err(err)
                     }
                 })
             });
-        Box::new(fut)
+        fut
     }
 }
 
@@ -145,7 +147,10 @@ impl Future for FutureConnection {
         }
 
         match self.pool.acquire() {
-            Conn::Now(conn) => Ok(Async::Ready(conn)),
+            Conn::Now(conn) => {
+                println!("Ready");
+                Ok(Async::Ready(conn))
+            },
             Conn::Future(mut conn) => {
                 let result = conn.poll();
                 if let Ok(Async::NotReady) = result {
@@ -154,7 +159,7 @@ impl Future for FutureConnection {
                 result
             }
             Conn::None => {
-                self.pool.enqueue(park());
+                self.pool.enqueue(task::current());
                 Ok(Async::NotReady)
             }
         }
@@ -164,6 +169,7 @@ impl Future for FutureConnection {
 #[derive(Debug)]
 pub enum Error {
     Connect(ConnectError),
+    Postgres(PostgresError),
 }
 
 impl fmt::Display for Error {
@@ -176,12 +182,69 @@ impl error::Error for Error {
     fn description(&self) -> &str {
         match *self {
             Error::Connect(ref err) => err.description(),
+            Error::Postgres(ref err) => err.description(),
         }
     }
 
     fn cause(&self) -> Option<&error::Error> {
         match *self {
             Error::Connect(ref err) => Some(err as &error::Error),
+            Error::Postgres(ref err) => Some(err as &error::Error),
         }
+    }
+}
+
+impl From<ConnectError> for Error {
+    fn from(err: ConnectError) -> Self {
+        Error::Connect(err)
+    }
+}
+
+impl From<PostgresError> for Error {
+    fn from(err: PostgresError) -> Self {
+        Error::Postgres(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use futures::Future;
+    use tokio_core::reactor::Core;
+    use {Pool, Conn, FutureConnection};
+
+    #[test]
+    fn acquire() {
+        let mut core = Core::new().expect("unable to initialize the main event loop");
+        let connection_string = "postgresql://brillen@localhost/brillen2";
+        let pool = Pool::new(connection_string, core.handle(), 20).unwrap();
+        let conn = pool.acquire();
+        match conn {
+            Conn::Now(_) => unreachable!(),
+            Conn::Future(conn) => {
+                core.run(conn).expect("error running the event loop");
+                assert!(true);
+            },
+            Conn::None => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn future_conn() {
+        let mut core = Core::new().expect("unable to initialize the main event loop");
+        let connection_string = "postgresql://brillen@localhost/brillen2";
+        let pool = Pool::new(connection_string, core.handle(), 20).unwrap();
+
+        let conn = FutureConnection {
+            pool: pool.clone(),
+            conn: None,
+        };
+        let called = RefCell::new(false);
+        let srv = conn.map(|_| {
+            let mut called = called.borrow_mut();
+            *called = true;
+        }).map_err(|_| unreachable!());
+        core.run(srv).expect("error running the event loop");
+        assert_eq!(true, *called.borrow());
     }
 }
