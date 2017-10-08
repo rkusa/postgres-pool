@@ -4,15 +4,13 @@ extern crate futures;
 extern crate tokio_core;
 extern crate tokio_postgres;
 
-use std::fmt;
 use std::error;
-use std::error::Error as _Error;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use futures::task::{self, Task};
 use futures::{Async, Future, Poll};
 use tokio_core::reactor::Handle;
-use tokio_postgres::error::{ConnectError, Error as PostgresError};
+use tokio_postgres::error::Error;
 use tokio_postgres::{Connection, TlsMode};
 use tokio_postgres::params::{ConnectParams, IntoConnectParams};
 
@@ -33,18 +31,16 @@ pub struct PoolRemote(Arc<Mutex<InnerPool>>);
 
 enum Conn {
     Now(Connection),
-    Future(Box<Future<Item = Connection, Error = ConnectError>>),
+    Future(Box<Future<Item = Connection, Error = Error>>),
     None,
 }
 
 impl Pool {
-    pub fn new<T>(params: T, handle: Handle, size: usize) -> Result<Self, ConnectError>
+    pub fn new<T>(params: T, handle: Handle, size: usize) -> Result<Self, Box<error::Error + 'static + Send + Sync>>
     where
         T: IntoConnectParams,
     {
-        let params = params.into_connect_params().map_err(
-            ConnectError::ConnectParams,
-        )?;
+        let params = params.into_connect_params()?;
 
         Ok(Pool {
             handle: handle,
@@ -110,7 +106,7 @@ impl Pool {
             let mut inner = pool1.inner.lock().unwrap();
             inner.size += 1;
 
-            E::from(Error::Connect(err))
+            E::from(err)
         }).and_then(move |conn| {
                 f(conn).then(move |res| match res {
                     Ok((result, conn)) => {
@@ -146,12 +142,12 @@ impl PoolRemote {
 
 struct FutureConnection {
     pool: Pool,
-    conn: Option<Box<Future<Item = Connection, Error = ConnectError>>>,
+    conn: Option<Box<Future<Item = Connection, Error = Error>>>,
 }
 
 impl Future for FutureConnection {
     type Item = Connection;
-    type Error = ConnectError;
+    type Error = Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         if let Some(ref mut conn) = self.conn {
@@ -172,46 +168,6 @@ impl Future for FutureConnection {
                 Ok(Async::NotReady)
             }
         }
-    }
-}
-
-#[derive(Debug)]
-pub enum Error {
-    Connect(ConnectError),
-    Postgres(PostgresError),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "{}", self.description())
-    }
-}
-
-impl error::Error for Error {
-    fn description(&self) -> &str {
-        match *self {
-            Error::Connect(ref err) => err.description(),
-            Error::Postgres(ref err) => err.description(),
-        }
-    }
-
-    fn cause(&self) -> Option<&error::Error> {
-        match *self {
-            Error::Connect(ref err) => Some(err as &error::Error),
-            Error::Postgres(ref err) => Some(err as &error::Error),
-        }
-    }
-}
-
-impl From<ConnectError> for Error {
-    fn from(err: ConnectError) -> Self {
-        Error::Connect(err)
-    }
-}
-
-impl From<PostgresError> for Error {
-    fn from(err: PostgresError) -> Self {
-        Error::Postgres(err)
     }
 }
 

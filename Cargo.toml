@@ -6,4 +6,4 @@ authors = ["Markus Ast <m@rkusa.st>"]
 [dependencies]
 futures = "0.1"
 tokio-core = "0.1"
-tokio-postgres = "0.2"
+tokio-postgres = "0.3"
