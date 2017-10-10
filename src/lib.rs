@@ -27,6 +27,7 @@ pub struct Pool {
     inner: Arc<Mutex<InnerPool>>,
 }
 
+#[derive(Clone)]
 pub struct PoolRemote(Arc<Mutex<InnerPool>>);
 
 enum Conn {
